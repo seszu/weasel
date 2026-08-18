@@ -199,19 +199,31 @@ STDMETHODIMP CCandidateList::FinalizeExactCompositionString() {
 }
 
 void CCandidateList::UpdateUI(const Context& ctx, const Status& status) {
+  _composing = !!status.composing;
+
   if (_ui->style().inline_preedit) {
     _ui->style().client_caps |= weasel::INLINE_PREEDIT_CAPABLE;
   } else {
     _ui->style().client_caps &= ~weasel::INLINE_PREEDIT_CAPABLE;
   }
-
   /// In UWP, candidate window will only be shown
   /// if it is owned by active view window
   //_UpdateOwner();
   _ui->Update(ctx, status);
   _UpdateUIElement();
 
-  if (status.composing)
+  // The TSF position edit session is asynchronous. It may finish before this
+  // status update. Apply that fresh caret only after UI::Update() has installed
+  // the new composing state; otherwise WeaselPanel::MoveTo() can mistake the
+  // update for an ASCII status tip and replace it with the mouse position.
+  if (_composing && _hasPendingInputPosition && !_positionReady) {
+    _ui->UpdateInputPosition(_pendingInputPosition);
+    _positionReady = true;
+    _awaitingComposition = false;
+  }
+
+  // Never reveal a new composition at the previous frame's position.
+  if (_composing && _positionReady)
     Show(_pbShow);
   else
     Show(FALSE);
@@ -222,20 +234,44 @@ void CCandidateList::UpdateStyle(const UIStyle& sty) {
 }
 
 void CCandidateList::UpdateInputPosition(RECT const& rc) {
+  _pendingInputPosition = rc;
+  _hasPendingInputPosition = true;
+
+  // StartUI() can run before UpdateUI() publishes the new composing state.
+  // Keep the fresh caret pending instead of passing it through the old
+  // non-composing UI state (which may invoke ascii_tip_follow_cursor).
+  if (_awaitingComposition && !_composing)
+    return;
+
   _ui->UpdateInputPosition(rc);
+  if (_composing) {
+    _positionReady = true;
+    _awaitingComposition = false;
+    // If UpdateUI() arrived first, it intentionally kept the window hidden.
+    Show(_pbShow);
+  }
 }
 
 void CCandidateList::Destroy() {
+  _positionReady = false;
+  _composing = false;
+  _awaitingComposition = false;
+  _hasPendingInputPosition = false;
   // EndUI();
   Show(FALSE);
   _DisposeUIWindow();
 }
 
 void CCandidateList::DestroyAll() {
+  _positionReady = false;
+  _composing = false;
+  _awaitingComposition = false;
+  _hasPendingInputPosition = false;
   // EndUI();
   Show(FALSE);
   _DisposeUIWindowAll();
 }
+
 UIStyle& CCandidateList::style() {
   // return _ui->style();
   return _style;
@@ -283,14 +319,23 @@ HRESULT CCandidateList::_UpdateUIElement() {
 }
 
 void CCandidateList::StartUI() {
-  if (_uiStarted)
+  // UIImpl/WeaselPanel can retain the previous input position, including the
+  // mouse position used by an ASCII status tip. Hide that stale frame until
+  // this composition has a fresh caret rectangle.
+  _positionReady = false;
+  _composing = false;
+  _awaitingComposition = true;
+  _hasPendingInputPosition = false;
+
+  if (_uiStarted) {
+    Show(FALSE);
     return;
+  }
 
   com_ptr<ITfThreadMgr> pThreadMgr = _tsf->_GetThreadMgr();
   if (!pThreadMgr) {
     return;
   }
-
   com_ptr<ITfUIElementMgr> pUIElementMgr;
   auto hr = pThreadMgr->QueryInterface(&pUIElementMgr);
   if (FAILED(hr))
@@ -299,7 +344,6 @@ void CCandidateList::StartUI() {
   if (pUIElementMgr == NULL) {
     return;
   }
-
   if (!_ui->uiCallback())
     _ui->SetUICallBack([this](size_t* const sel, size_t* const hov,
                               bool* const next, bool* const scroll_next) {
@@ -316,6 +360,11 @@ void CCandidateList::StartUI() {
 }
 
 void CCandidateList::EndUI() {
+  _positionReady = false;
+  _composing = false;
+  _awaitingComposition = false;
+  _hasPendingInputPosition = false;
+
   if (!_uiStarted)
     return;
 

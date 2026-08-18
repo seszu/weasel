@@ -1220,29 +1220,45 @@ void WeaselPanel::MoveTo(RECT const& rc) {
 }
 
 void WeaselPanel::_RepositionWindow(const bool& adj) {
-  RECT rcWorkArea;
-  memset(&rcWorkArea, 0, sizeof(rcWorkArea));
-  HMONITOR hMonitor = MonitorFromRect(m_inputPos, MONITOR_DEFAULTTONEAREST);
-  if (hMonitor) {
-    MONITORINFO info;
-    info.cbSize = sizeof(MONITORINFO);
-    if (GetMonitorInfo(hMonitor, &info)) {
-      rcWorkArea = info.rcWork;
-    }
-    if (hMonitor != m_hMonitor) {
-      m_hMonitor = hMonitor;
-      m_redraw_by_monitor_change = true;
-    }
+  // Trust the input rectangle for monitor selection only when it actually
+  // intersects a real display. Otherwise prefer the foreground app monitor.
+  HMONITOR hMonitor = MonitorFromRect(m_inputPos, MONITOR_DEFAULTTONULL);
+  if (!hMonitor) {
+    HWND foreground = ::GetForegroundWindow();
+    if (foreground)
+      hMonitor = ::MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
   }
+  if (!hMonitor)
+    hMonitor = MonitorFromRect(m_inputPos, MONITOR_DEFAULTTONEAREST);
+  if (!hMonitor)
+    return;
+
+  MONITORINFO info = {};
+  info.cbSize = sizeof(info);
+  if (!GetMonitorInfo(hMonitor, &info))
+    return;
+
+  RECT rcWorkArea = info.rcWork;
+  if (hMonitor != m_hMonitor) {
+    m_hMonitor = hMonitor;
+    m_redraw_by_monitor_change = true;
+  }
+
   RECT rcWindow;
   GetWindowRect(&rcWindow);
   int width = (rcWindow.right - rcWindow.left);
   int height = (rcWindow.bottom - rcWindow.top);
-  // keep panel visible
-  rcWorkArea.right -= width;
-  rcWorkArea.bottom -= height;
+
+  int maxX = rcWorkArea.right - width;
+  int maxY = rcWorkArea.bottom - height;
+  if (maxX < rcWorkArea.left)
+    maxX = rcWorkArea.left;
+  if (maxY < rcWorkArea.top)
+    maxY = rcWorkArea.top;
+
   int x = m_inputPos.left;
   int y = m_inputPos.bottom;
+
   if (DPI_SCALE(m_style.shadow_radius)) {
     x -= (DPI_SCALE(m_style.shadow_offset_x) >= 0 ||
           COLORTRANSPARENT(m_style.shadow_color))
@@ -1254,24 +1270,26 @@ void WeaselPanel::_RepositionWindow(const bool& adj) {
                ? m_layout->offsetY
                : (m_layout->offsetY / 2);
   }
-  // for vertical text layout, flow right to left, make window left side
+
   if (m_style.layout_type == UIStyle::LAYOUT_VERTICAL_TEXT &&
       !m_style.vertical_text_left_to_right) {
     x += m_layout->offsetX - width;
     if (DPI_SCALE(m_style.shadow_offset_x) < 0)
       x += m_layout->offsetX;
   }
+
   if (adj)
     m_istorepos = false;
-  if (x > rcWorkArea.right)
-    x = rcWorkArea.right;  // over workarea right
+
+  if (x > maxX)
+    x = maxX;
   if (x < rcWorkArea.left)
-    x = rcWorkArea.left;  // over workarea left
-  // show panel above the input focus if we're around the bottom
-  if (y > rcWorkArea.bottom || m_sticky) {
+    x = rcWorkArea.left;
+
+  if (y > maxY || m_sticky) {
     if (!m_sticky)
       m_sticky = true;
-    y = m_inputPos.top - height - 6;  // over workarea bottom
+    y = m_inputPos.top - height - 6;
     if (DPI_SCALE(m_style.shadow_radius) &&
         DPI_SCALE(m_style.shadow_offset_y) > 0)
       y -= DPI_SCALE(m_style.shadow_offset_y);
@@ -1283,9 +1301,13 @@ void WeaselPanel::_RepositionWindow(const bool& adj) {
                ? m_layout->offsetY
                : (m_layout->offsetY / 2);
   }
+
+  // Final safety net: never allow SetWindowPos() outside the work area.
+  if (y > maxY)
+    y = maxY;
   if (y < rcWorkArea.top)
-    y = rcWorkArea.top;  // over workarea top
-  // memorize adjusted position (to avoid window bouncing on height change)
+    y = rcWorkArea.top;
+
   m_inputPos.bottom = y;
   SetWindowPos(HWND_TOPMOST, x, y, 0, 0,
                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);

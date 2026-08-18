@@ -49,7 +49,11 @@ STDMETHODIMP WeaselTSF::DoEditSession(TfEditCookie ec) {
     }
   }
 
-  if (ok && !compositionEnded)
+  // _StartComposition() requests an asynchronous edit session. On the first
+  // key of a new composition, _pComposition can still be null here. Avoid
+  // querying the host for a transient pre-layout position; the start-
+  // composition edit session will update the position after creation.
+  if (ok && !compositionEnded && _IsComposing())
     _UpdateCompositionWindow(_pEditSessionContext);
   // Keep the existing candidate window alive during top-word input, but
   // publish the new candidates in this key-down edit session. Positioning is

@@ -4,6 +4,91 @@
 #include "ResponseParser.h"
 #include "CandidateList.h"
 
+namespace {
+
+HMONITOR MonitorFromInputRect(const RECT& inputRect, DWORD flags) {
+  RECT rc = inputRect;
+  if (rc.right <= rc.left)
+    rc.right = rc.left + 1;
+  if (rc.bottom <= rc.top)
+    rc.bottom = rc.top + 1;
+  return ::MonitorFromRect(&rc, flags);
+}
+
+bool TryGetCaretRectOnScreen(HWND referenceWindow, RECT* rc) {
+  if (!referenceWindow || !rc)
+    return false;
+
+  DWORD threadId = ::GetWindowThreadProcessId(referenceWindow, nullptr);
+  if (!threadId)
+    return false;
+
+  GUITHREADINFO gui = {};
+  gui.cbSize = sizeof(gui);
+  if (!::GetGUIThreadInfo(threadId, &gui) || !gui.hwndCaret)
+    return false;
+
+  // GUITHREADINFO::rcCaret is relative to hwndCaret. Convert it to screen
+  // coordinates explicitly instead of adding a top-level window origin.
+  *rc = gui.rcCaret;
+  ::SetLastError(ERROR_SUCCESS);
+  if (::MapWindowPoints(gui.hwndCaret, HWND_DESKTOP,
+                        reinterpret_cast<LPPOINT>(rc), 2) == 0 &&
+      ::GetLastError() != ERROR_SUCCESS) {
+    return false;
+  }
+
+  if (rc->right <= rc->left)
+    rc->right = rc->left + 1;
+  if (rc->bottom <= rc->top)
+    rc->bottom = rc->top + 1;
+
+  return MonitorFromInputRect(*rc, MONITOR_DEFAULTTONULL) != nullptr;
+}
+
+void ClampInputRectToMonitor(RECT* rc, HMONITOR monitor) {
+  if (!rc || !monitor)
+    return;
+
+  MONITORINFO info = {};
+  info.cbSize = sizeof(info);
+  if (!::GetMonitorInfo(monitor, &info))
+    return;
+
+  LONG width = rc->right - rc->left;
+  LONG height = rc->bottom - rc->top;
+  if (width < 1)
+    width = 1;
+  if (height < 1)
+    height = 1;
+
+  LONG maxLeft = info.rcWork.right - width;
+  LONG maxTop = info.rcWork.bottom - height;
+  if (maxLeft < info.rcWork.left)
+    maxLeft = info.rcWork.left;
+  if (maxTop < info.rcWork.top)
+    maxTop = info.rcWork.top;
+
+  LONG left = rc->left;
+  LONG top = rc->top;
+  if (left < info.rcWork.left)
+    left = info.rcWork.left;
+  else if (left > maxLeft)
+    left = maxLeft;
+  if (top < info.rcWork.top)
+    top = info.rcWork.top;
+  else if (top > maxTop)
+    top = maxTop;
+
+  rc->left = left;
+  rc->top = top;
+  rc->right = left + width;
+  rc->bottom = top + height;
+}
+
+
+}  // namespace
+
 /* Start Composition */
 class CStartCompositionEditSession : public CEditSession {
  public:
@@ -160,8 +245,8 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
   com_ptr<ITfInsertAtSelection> pInsertAtSelection;
   com_ptr<ITfRange> pRangeComposition;
   ITfRange* pRange;
-  RECT rc;
-  BOOL fClipped;
+  RECT rc = {};
+  BOOL fClipped = FALSE;
   TF_SELECTION selection;
   ULONG nSelection;
 
@@ -175,37 +260,176 @@ STDMETHODIMP CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
   if (_pComposition != nullptr && _pComposition->GetRange(&pRange) == S_OK) {
     pRange->Collapse(ec, TF_ANCHOR_START);
   } else {
-    // composition end
-    // note: selection.range is always an empty range
+    // composition end / no usable composition range
     pRange = selection.range;
   }
 
-  if ((_pContextView->GetTextExt(ec, pRange, &rc, &fClipped)) == S_OK &&
-      (rc.left != 0 || rc.top != 0)) {
-    // get the foreground window pos and check if rc from GetTextExt is out of
-    // window
-    if (_enhancedPosition) {
-      HWND hwnd;
-      RECT rcForegroundWindow;
-      hwnd = GetForegroundWindow();
-      ::GetWindowRect(hwnd, &rcForegroundWindow);
+  HWND hwndView = nullptr;
+  _pContextView->GetWnd(&hwndView);
+  HWND referenceWindow = hwndView ? hwndView : ::GetForegroundWindow();
 
-      if (rc.left < rcForegroundWindow.left ||
-          rc.left > rcForegroundWindow.right ||
-          rc.top < rcForegroundWindow.top ||
-          rc.top > rcForegroundWindow.bottom) {
-        POINT pt;
-        bool hasCaret = ::GetCaretPos(&pt);
-        int offsetx = rcForegroundWindow.left - rc.left + (hasCaret ? pt.x : 0);
-        int offsety = rcForegroundWindow.top - rc.top + (hasCaret ? pt.y : 0);
-        rc.left += offsetx;
-        rc.right += offsetx;
-        rc.top += offsety;
-        rc.bottom += offsety;
+  RECT rcReference = {};
+  const bool hasReferenceRect =
+      referenceWindow && ::GetWindowRect(referenceWindow, &rcReference);
+
+  const HRESULT textExtHr =
+      _pContextView->GetTextExt(ec, pRange, &rc, &fClipped);
+
+  bool needFallback = FAILED(textExtHr);
+
+  // Some custom text hosts (AutoCAD is a confirmed example) briefly return
+  // S_OK with a zero-height sentinel rectangle outside the active text view.
+  // A valid TSF rectangle normally follows shortly afterwards, but on rare
+  // frames that delay can be much longer than 150 ms.
+  //
+  // For that specific transient signature, prefer:
+  //   1. a valid Win32 caret in the same text view;
+  //   2. the most recent trustworthy TSF rectangle for the same text window;
+  //   3. short deferral;
+  //   4. only then the generic monitor fallback.
+  //
+  // This avoids flashing at a screen/window corner while preserving the
+  // "candidate must eventually remain visible" guarantee.
+  static thread_local ULONGLONG transientBadRectSince = 0;
+  static thread_local HWND transientBadRectWindow = nullptr;
+  static thread_local RECT lastGoodTsfRect = {};
+  static thread_local ULONGLONG lastGoodTsfTick = 0;
+  static thread_local HWND lastGoodTsfWindow = nullptr;
+
+  bool outsideReferenceWindow = false;
+  bool usableReferenceRect = false;
+  bool transientLayoutRect = false;
+
+  if (SUCCEEDED(textExtHr)) {
+    const bool zeroRect =
+        rc.left == 0 && rc.top == 0 && rc.right == 0 && rc.bottom == 0;
+    const bool offscreen =
+        MonitorFromInputRect(rc, MONITOR_DEFAULTTONULL) == nullptr;
+
+    usableReferenceRect =
+        hasReferenceRect && rcReference.right > rcReference.left &&
+        rcReference.bottom > rcReference.top;
+
+    if (usableReferenceRect) {
+      outsideReferenceWindow =
+          rc.left < rcReference.left || rc.left >= rcReference.right ||
+          rc.top < rcReference.top || rc.top >= rcReference.bottom;
+    }
+
+    const bool zeroHeight = rc.bottom <= rc.top;
+    transientLayoutRect =
+        usableReferenceRect && outsideReferenceWindow && zeroHeight;
+
+    if (transientLayoutRect) {
+      const ULONGLONG now = ::GetTickCount64();
+
+      if (transientBadRectSince == 0 ||
+          transientBadRectWindow != referenceWindow) {
+        transientBadRectSince = now;
+        transientBadRectWindow = referenceWindow;
+      }
+
+      // First choice: if the host exposes a genuine Win32 caret, use it.
+      RECT rcCaret = {};
+      if (TryGetCaretRectOnScreen(referenceWindow, &rcCaret)) {
+        const bool caretInsideReference =
+            !usableReferenceRect ||
+            (rcCaret.left >= rcReference.left &&
+             rcCaret.left < rcReference.right &&
+             rcCaret.top >= rcReference.top &&
+             rcCaret.top < rcReference.bottom);
+
+        if (caretInsideReference) {
+          rc = rcCaret;
+          _pTextService->_SetCompositionPosition(rc);
+          return S_OK;
+        }
+      }
+
+      // Second choice: reuse the last trustworthy TSF position from this same
+      // text window. In AutoCAD this is normally the immediately preceding
+      // character position, so the candidate remains close to the real caret
+      // until the new layout rectangle arrives.
+      bool lastGoodUsable =
+          lastGoodTsfWindow == referenceWindow && lastGoodTsfTick != 0 &&
+          now - lastGoodTsfTick <= 10000 &&
+          MonitorFromInputRect(lastGoodTsfRect, MONITOR_DEFAULTTONULL) !=
+              nullptr;
+
+      if (lastGoodUsable && usableReferenceRect) {
+        lastGoodUsable =
+            lastGoodTsfRect.left >= rcReference.left &&
+            lastGoodTsfRect.left < rcReference.right &&
+            lastGoodTsfRect.top >= rcReference.top &&
+            lastGoodTsfRect.top < rcReference.bottom;
+      }
+
+      if (lastGoodUsable) {
+        rc = lastGoodTsfRect;
+        _pTextService->_SetCompositionPosition(rc);
+        return S_OK;
+      }
+
+      // There is no safe position to reuse yet. Give the host considerably
+      // longer than the old 150 ms before falling back to a screen anchor.
+      if (now - transientBadRectSince < 2000) {
+        return S_OK;
+      }
+
+      needFallback = true;
+    } else {
+      transientBadRectSince = 0;
+      transientBadRectWindow = nullptr;
+
+      needFallback =
+          zeroRect || offscreen ||
+          (_enhancedPosition && outsideReferenceWindow);
+
+      // Cache only a genuinely accepted TSF rectangle. Do not contaminate
+      // this cache with caret/fallback coordinates.
+      if (!needFallback) {
+        lastGoodTsfRect = rc;
+        lastGoodTsfTick = ::GetTickCount64();
+        lastGoodTsfWindow = referenceWindow;
       }
     }
-    _pTextService->_SetCompositionPosition(rc);
   }
+
+  if (needFallback) {
+    RECT rcCaret = {};
+    if (TryGetCaretRectOnScreen(referenceWindow, &rcCaret)) {
+      rc = rcCaret;
+    } else {
+
+      LONG width = 1;
+      LONG height = 1;
+      if (SUCCEEDED(textExtHr)) {
+        if (rc.right > rc.left)
+          width = rc.right - rc.left;
+        if (rc.bottom > rc.top)
+          height = rc.bottom - rc.top;
+      }
+
+      if (hasReferenceRect) {
+        rc.left = rcReference.left;
+        rc.top = rcReference.top;
+        rc.right = rc.left + width;
+        rc.bottom = rc.top + height;
+      } else {
+        rc = {0, 0, width, height};
+      }
+
+      HMONITOR monitor = nullptr;
+      if (referenceWindow)
+        monitor = ::MonitorFromWindow(referenceWindow, MONITOR_DEFAULTTONEAREST);
+      if (!monitor)
+        monitor = MonitorFromInputRect(rc, MONITOR_DEFAULTTONEAREST);
+      ClampInputRectToMonitor(&rc, monitor);
+    }
+  }
+
+
+  _pTextService->_SetCompositionPosition(rc);
   return S_OK;
 }
 

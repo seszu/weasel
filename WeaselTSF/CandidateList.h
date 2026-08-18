@@ -86,6 +86,15 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
 
   BOOL _pbShow;
   bool _uiStarted = false;
+
+  // Do not expose a candidate window at a stale position while the new
+  // composition is waiting for its asynchronous caret-position edit session.
+  bool _positionReady = false;
+  bool _composing = false;
+  bool _awaitingComposition = false;
+  bool _hasPendingInputPosition = false;
+  RECT _pendingInputPosition = {};
+
   weasel::UIStyle _style;
 
   com_ptr<ITfContext> _pContextDocument;
